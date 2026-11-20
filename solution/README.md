@@ -130,3 +130,137 @@ Measured by `bench_scale.py`:
 No path optimisation, no measurement adjustment/least-squares, no inference
 of missing positions. Nothing beyond the one explicit base correction is
 changed.
+
+---
+
+# Cross-season handover, ground lineage and maintenance settlement
+
+The catalog above resolves labels inside *one* measurement. Every quarter the
+trail is re-measured onto a new axis, so three more modules answer the
+cross-season questions: what ground survived, what it can still be paid for,
+and how a later correction re-opens an already-signed batch.
+
+```
+chainage_catalog.py      one-season axes, label<->physical, exact Fractions
+        |
+handover_book.py         immutable, versioned old/new half-open interval pairs
+        |
+ground_lineage.py        walks the pinned chain; birth identity + per-step loss
+        |
+maintenance_ledger.py    contract clipping, once-only payment, vouchers,
+                         signed batches, replay, correction advice
+```
+
+## Handover books (`handover_book.py`)
+
+A book for one adjacent season edge is a list of pairs
+`old [a,b) == new [c,d)` of the same ground. Validation enforces the problem
+rules: equal length, same orientation (slope +1), mutually non-overlapping old
+sides and new sides, everything inside the two axes. An **empty pair list is
+legal**: the whole old axis is retired and the whole new axis newly built.
+
+* old-axis parts no pair claims = **retired ground** (`retired_parts`);
+* new-axis parts no pair claims = **newly built ground** (`new_build_parts`).
+
+Books are immutable. A re-survey mistake is fixed by appending a **correction
+version** that re-pairs the *same two axes* and names its predecessor via
+`supersedes`; the registry re-points `current()` but every old version stays
+readable and every voucher pins the exact version it used. A correction may
+not change axis lengths or skip the predecessor chain.
+
+Sorted pair-side indices plus a cached start array make `map_forward` /
+`map_backward` a binary-search window: cost is `O(log p + k)` for the `k`
+pairs actually intersecting the query, not a full-axis scan.
+
+## Ground identity and lineage (`ground_lineage.py`)
+
+Labels and mileage are never evidence of identity — only the handover chain
+is. A fragment's identity is its **birth**: the earliest season whose axis
+contains it plus its half-open interval there. The forward walk carries both
+the current-axis working interval and the birth-axis interval, clipping both
+through the same slope-+1 pair at every edge, so:
+
+* `trace_forward(span, target)` returns every surviving target fragment and a
+  `TraceStep` per edge recording exactly which pieces were carried and the
+  length lost there (`loss_by_step`);
+* `trace_back_origin` separates inherited ground from ground **born on the
+  target axis**. New build is never back-dated: rebuilding the same mileage or
+  reusing the same label later gets a fresh identity;
+* `birth_piece_at_target` affine-walks one birth sub-piece forward and raises
+  if it was retired before the target season.
+
+Corrections are handled by the `pins` map (`edge -> version_id`). Re-walking
+the same span under corrected books re-derives everything from immutable
+evidence; the previous walk is never edited.
+
+## Maintenance settlement (`maintenance_ledger.py`)
+
+A `Contract` is non-overlapping priced half-open zones on one target season.
+Settlement of a report:
+
+1. map its intervals onto the target axis under the pinned books (a
+   same-season report still runs the backward ancestry walk, so native new
+   build is excluded);
+2. clip to the priced contract zones;
+3. keep only **inherited** ground — new build is not paid even when covered;
+4. deduct ground already paid, keyed by birth identity. Within one batch the
+   reports are allocated in the **explicit order given**, so the first report
+   owns every contested overlap.
+
+Each `VoucherLine` records the target ground paid, its birth ancestry, the
+report, the zone/price and the exact handover versions. Money is exact
+(`Fraction` length × price). A `SettlementBatch` is a frozen, JSON-serialisable
+artifact; `replay_batch` re-runs the same reports, pins and prior ledger and
+asserts the lines and total reproduce byte-for-byte, so a signed batch is
+explainable offline.
+
+### Corrections do not touch old vouchers
+
+`advise_correction` re-simulates a signed batch under corrected pins and
+compares voucher by voucher **on target-axis ground** (a fragment present
+before and after is the same maintenance object even though its resolved
+birth identity changed — that change is the erratum's content). It emits:
+
+* `credit` (应补) and `debit` (应减) per voucher;
+* `blocked` when a simulated extra credit's birth ground is already held by
+  another confirmed voucher — the same physical ground is never paid twice,
+  even through an erratum. Blocked amounts never enter net cash.
+
+The original batch and vouchers remain unchanged until a human confirms the
+advice.
+
+## Running the new layer
+
+```bash
+python3 solution/run_cross_season.py            # worked example + 3-season demo
+python3 solution/run_cross_season.py --out DIR  # also write JSON evidence
+python3 solution/bench_cross_season.py          # 6 seasons / 300 reports stress
+python3 -m unittest discover -s solution/tests  # all suites (92 tests)
+```
+
+### The worked example, reproduced exactly
+
+Old report `[0,8)`, handover `old[0,3)->new[0,3)` and
+`old[5,8)->new[6,9)`, a new middle section that merely reuses an old label,
+contract new `[0,8)` at unit price 2:
+
+| scenario | payable length | amount |
+|---|---|---|
+| no prior payments | 5 | **10** |
+| ground `[6,7)` already paid | 4 | **8** |
+| corrected book, second pair -> `new[5,8)`, empty ledger | 6 | **12** |
+
+The new middle `[3,6)` is new-build ground: the demo's ancestry query reports
+its birth season as the new season, so it contributes nothing even though it
+carries an old label.
+
+### Three-season demo coverage
+
+`run_cross_season.py` Part B walks Q1→Q2→Q3 and deliberately covers:
+half-open and rational zone boundaries; a repeated label (label 2 on two
+sections in one season, disambiguated by the bound section, and label 5 reused
+on brand-new Q3 ground); per-step loss over chained edges; same-batch order
+allocation with the overlap paid once; native new-build excluded; signed-batch
+replay from JSON; a correction producing per-voucher debit/credit; and a
+correction whose extra credit is **blocked** by an external confirmed voucher.
+
